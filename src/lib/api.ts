@@ -1,4 +1,4 @@
-const API_URL = 'http://localhost:3001/api';
+const API_URL = import.meta.env.MODE === 'production' ? '/api' : 'http://localhost:3001/api';
 
 export interface Libro {
   id: string;
