@@ -242,9 +242,9 @@ app.put('/api/prestamos/:id', async (req, res) => {
   }
 });
 
-// Ruta catch-all para React Router (debe ir AL FINAL)
+// Ruta catch-all para React Router (debe ir AL FINAL, después de todas las rutas API)
 if (process.env.NODE_ENV === 'production') {
-  app.get('/*', (req, res) => {
+  app.use((req, res) => {
     res.sendFile(path.join(__dirname, 'dist', 'index.html'));
   });
 }
