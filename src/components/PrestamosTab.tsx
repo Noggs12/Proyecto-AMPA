@@ -1,6 +1,23 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
-import { Plus, CheckCircle, AlertCircle, Clock, Search, ClipboardCheck, BellRing } from 'lucide-react';
-import { api, type Prestamo, type Alumno, type Libro } from '../lib/api';
+import {
+  Plus,
+  CheckCircle,
+  AlertCircle,
+  Clock,
+  Search,
+  ClipboardCheck,
+  BellRing,
+  FileDown,
+} from 'lucide-react';
+import {
+  api,
+  type Prestamo,
+  type Alumno,
+  type Libro,
+  type Materia,
+  type CatalogoParte,
+  type LibroEjemplar,
+} from '../lib/api';
 
 type PrestamoConDetalles = Prestamo & {
   alumno?: Alumno;
@@ -12,6 +29,14 @@ const getDefaultDueDate = () => {
   date.setDate(date.getDate() + 15);
   return date.toISOString().split('T')[0];
 };
+
+const normasUso = [
+  'Forrar el libro y mantenerlo identificado con el nombre del alumno.',
+  'No escribir ni subrayar sobre los ejemplares salvo indicación expresa.',
+  'Avisar al AMPA si se detectan desperfectos para valorarlos de inmediato.',
+  'Transportar el libro protegido (mochila/funda) para evitar daños.',
+  'En caso de pérdida o deterioro irreparable se repondrá o abonará el ejemplar.',
+];
 
 // ===================================
 // 🐛 CORRECCIÓN: Funciones movidas fuera del componente
@@ -52,24 +77,66 @@ export default function PrestamosTab() {
   const [prestamos, setPrestamos] = useState<PrestamoConDetalles[]>([]);
   const [alumnos, setAlumnos] = useState<Alumno[]>([]);
   const [libros, setLibros] = useState<Libro[]>([]);
+  const [materias, setMaterias] = useState<Materia[]>([]);
+  const [catalogoPartes, setCatalogoPartes] = useState<CatalogoParte[]>([]);
   const [showModal, setShowModal] = useState(false);
   const [filter, setFilter] = useState<'todos' | 'activo' | 'devuelto' | 'retrasado'>('todos');
   const [searchTerm, setSearchTerm] = useState('');
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const [ejemplaresDisponibles, setEjemplaresDisponibles] = useState<LibroEjemplar[]>([]);
+  const [estadoEntrega, setEstadoEntrega] = useState<Record<string, string>>({});
+  const [estadoDevolucion, setEstadoDevolucion] = useState<Record<string, string>>({});
+  const [devolucionModal, setDevolucionModal] = useState<PrestamoConDetalles | null>(null);
+  const [reemplazoEjemplares, setReemplazoEjemplares] = useState<LibroEjemplar[]>([]);
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState<string | null>(null);
 
   // CAMBIO 1.1: Añadir fecha_prestamo a formData
   const [formData, setFormData] = useState({
     alumno_id: '',
+    materia_id: '',
     libro_id: '',
+    ejemplar_id: '',
     fecha_prestamo: new Date().toISOString().split('T')[0], 
     fecha_devolucion_esperada: getDefaultDueDate(),
+    valoracion_entrega: '',
+    observaciones_entrega: '',
+    normas_aceptadas: false,
+  });
+  const [devolucionForm, setDevolucionForm] = useState({
+    fecha_devolucion_real: new Date().toISOString().split('T')[0],
+    valoracion_devolucion: '',
+    observaciones_devolucion: '',
+    importe_cobrar: 0,
+    abonado: false,
+    nuevo_ejemplar_id: '',
   });
 
   useEffect(() => {
     loadPrestamos();
     loadAlumnos();
     loadLibros();
+    loadMaterias();
+    loadCatalogo();
   }, []);
+
+  useEffect(() => {
+    if (catalogoPartes.length === 0) return;
+    const base = catalogoPartes.reduce<Record<string, string>>((acc, parte) => {
+      acc[parte.nombre] = parte.opciones[0] || '';
+      return acc;
+    }, {});
+    setEstadoEntrega(base);
+    setEstadoDevolucion(base);
+  }, [catalogoPartes]);
+
+  useEffect(() => {
+    if (!formData.libro_id) {
+      setEjemplaresDisponibles([]);
+      setFormData((prev) => ({ ...prev, ejemplar_id: '' }));
+      return;
+    }
+    loadEjemplaresDisponibles(formData.libro_id);
+  }, [formData.libro_id]);
 
   // useMemo ahora puede acceder a getEstadoActual sin error
   const resumen = useMemo(() => {
@@ -88,11 +155,18 @@ export default function PrestamosTab() {
     };
   }, [prestamos]);
 
+  const librosDisponibles = formData.materia_id
+    ? libros.filter((libro) => libro.materia_id === formData.materia_id)
+    : libros;
+
   const loadPrestamos = async () => {
     try {
       const data = await api.prestamos.getAll();
       const alumnos = await api.alumnos.getAll();
-      const libros = await api.libros.getAll();
+      const libros = (await api.libros.getAll()).map((libro) => ({
+        ...libro,
+        materia_id: libro.materia_id ? String(libro.materia_id) : '',
+      }));
 
       const prestamosConDetalles: PrestamoConDetalles[] = data.map(prestamo => ({
         ...prestamo,
@@ -118,9 +192,40 @@ export default function PrestamosTab() {
   const loadLibros = async () => {
     try {
       const data = await api.libros.getAll();
-      setLibros(data);
+      const normalizados = data.map((libro) => ({
+        ...libro,
+        materia_id: libro.materia_id ? String(libro.materia_id) : '',
+      }));
+      setLibros(normalizados);
     } catch (error: any) {
       alert('Error al cargar libros: ' + error.message);
+    }
+  };
+
+  const loadMaterias = async () => {
+    try {
+      const data = await api.materias.getAll();
+      setMaterias(data);
+    } catch (error: any) {
+      console.error(error);
+    }
+  };
+
+  const loadCatalogo = async () => {
+    try {
+      const data = await api.catalogo.getPartes();
+      setCatalogoPartes(data);
+    } catch (error: any) {
+      console.error(error);
+    }
+  };
+
+  const loadEjemplaresDisponibles = async (libroId: string) => {
+    try {
+      const data = await api.ejemplares.getByLibro(libroId);
+      setEjemplaresDisponibles(data.filter((ejemplar) => ejemplar.disponible));
+    } catch (error: any) {
+      alert('Error al cargar ejemplares disponibles: ' + error.message);
     }
   };
 
@@ -128,8 +233,18 @@ export default function PrestamosTab() {
     e.preventDefault();
 
     const libro = libros.find((l) => l.id === formData.libro_id);
-    if (!libro || libro.cantidad_disponible <= 0) {
-      alert('Este libro no está disponible');
+    if (!libro) {
+      alert('Selecciona un libro válido');
+      return;
+    }
+
+    if (!formData.ejemplar_id) {
+      alert('Debes seleccionar un ejemplar específico para entregar.');
+      return;
+    }
+
+    if (!formData.normas_aceptadas) {
+      alert('Es necesario aceptar las normas para continuar.');
       return;
     }
 
@@ -153,15 +268,14 @@ export default function PrestamosTab() {
       await api.prestamos.create({
         alumno_id: formData.alumno_id,
         libro_id: formData.libro_id,
-        // CAMBIO 1.2: Enviar la fecha del formulario
-        fecha_prestamo: fechaPrestamoISO, 
+        ejemplar_id: formData.ejemplar_id,
+        fecha_prestamo: fechaPrestamoISO,
         fecha_devolucion_esperada: fechaDevolucionEsperada.toISOString().split('T')[0],
         estado: 'activo',
-      });
-
-      await api.libros.update(formData.libro_id, {
-        ...libro,
-        cantidad_disponible: libro.cantidad_disponible - 1
+        estado_componentes_entrega: estadoEntrega,
+        valoracion_entrega: formData.valoracion_entrega,
+        observaciones_entrega: formData.observaciones_entrega,
+        normas_aceptadas: formData.normas_aceptadas,
       });
     } catch (error: any) {
       alert('Error: ' + error.message);
@@ -171,39 +285,101 @@ export default function PrestamosTab() {
     setShowModal(false);
     setFormData({
       alumno_id: '',
+      materia_id: '',
       libro_id: '',
+      ejemplar_id: '',
       // CAMBIO 1.3: Resetear fecha_prestamo
       fecha_prestamo: new Date().toISOString().split('T')[0],
       fecha_devolucion_esperada: getDefaultDueDate(),
+      valoracion_entrega: '',
+      observaciones_entrega: '',
+      normas_aceptadas: false,
     });
+    if (catalogoPartes.length) {
+      const base = catalogoPartes.reduce<Record<string, string>>((acc, parte) => {
+        acc[parte.nombre] = parte.opciones[0] || '';
+        return acc;
+      }, {});
+      setEstadoEntrega(base);
+    }
     loadPrestamos();
     loadLibros();
   };
 
-  const handleDevolucion = async (prestamo: PrestamoConDetalles) => {
-    if (!confirm('¿Marcar este libro como devuelto?')) return;
+  const openDevolucionModal = async (prestamo: PrestamoConDetalles) => {
+    setDevolucionModal(prestamo);
+    setDevolucionForm({
+      fecha_devolucion_real: new Date().toISOString().split('T')[0],
+      valoracion_devolucion: '',
+      observaciones_devolucion: '',
+      importe_cobrar: prestamo.importe_cobrar ?? prestamo.libro?.precio ?? 0,
+      abonado: prestamo.abonado ?? false,
+      nuevo_ejemplar_id: '',
+    });
 
-    const fechaDevolucion = new Date().toISOString().split('T')[0];
+    const base = catalogoPartes.reduce<Record<string, string>>((acc, parte) => {
+      acc[parte.nombre] =
+        prestamo.estado_componentes_devolucion?.[parte.nombre] ||
+        prestamo.estado_componentes_entrega?.[parte.nombre] ||
+        parte.opciones[0] ||
+        '';
+      return acc;
+    }, {});
+    setEstadoDevolucion(base);
 
     try {
-      await api.prestamos.update(prestamo.id, {
-        fecha_devolucion_real: fechaDevolucion,
-        estado: 'devuelto',
-      });
-
-      if (prestamo.libro) {
-        await api.libros.update(prestamo.libro_id, {
-          ...prestamo.libro,
-          cantidad_disponible: prestamo.libro.cantidad_disponible + 1
-        });
-      }
-    } catch (error: any) {
-      alert('Error: ' + error.message);
-      return;
+      const data = await api.ejemplares.getByLibro(prestamo.libro_id);
+      setReemplazoEjemplares(data.filter((ejemplar) => ejemplar.disponible));
+    } catch (error) {
+      console.error(error);
     }
+  };
 
-    loadPrestamos();
-    loadLibros();
+  const closeDevolucionModal = () => {
+    setDevolucionModal(null);
+    setReemplazoEjemplares([]);
+  };
+
+  const handleDevolucionSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!devolucionModal) return;
+
+    try {
+      await api.prestamos.update(devolucionModal.id, {
+        fecha_devolucion_real: devolucionForm.fecha_devolucion_real,
+        estado: 'devuelto',
+        estado_componentes_devolucion: estadoDevolucion,
+        valoracion_devolucion: devolucionForm.valoracion_devolucion,
+        observaciones_devolucion: devolucionForm.observaciones_devolucion,
+        importe_cobrar: devolucionForm.importe_cobrar,
+        abonado: devolucionForm.abonado,
+        nuevo_ejemplar_id: devolucionForm.nuevo_ejemplar_id || undefined,
+      });
+      closeDevolucionModal();
+      loadPrestamos();
+      loadLibros();
+    } catch (error: any) {
+      alert('No se pudo registrar la devolución: ' + error.message);
+    }
+  };
+
+  const handleGenerarPDF = async (prestamoId: string) => {
+    try {
+      setIsGeneratingPdf(prestamoId);
+      const blob = await api.prestamos.generarPDF(prestamoId);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `prestamo-${prestamoId}.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (error: any) {
+      alert('No se pudo generar el PDF: ' + error.message);
+    } finally {
+      setIsGeneratingPdf(null);
+    }
   };
   
   // *** NOTA: getDiasRestantes, getEstadoActual y describeDiasRestantes han sido movidas arriba ***
@@ -245,11 +421,23 @@ export default function PrestamosTab() {
             onClick={() => {
               setFormData({
                 alumno_id: '',
+                materia_id: '',
                 libro_id: '',
+                ejemplar_id: '',
                 // Resetear fecha de préstamo al abrir el modal
                 fecha_prestamo: new Date().toISOString().split('T')[0], 
                 fecha_devolucion_esperada: getDefaultDueDate(),
+                valoracion_entrega: '',
+                observaciones_entrega: '',
+                normas_aceptadas: false,
               });
+              if (catalogoPartes.length) {
+                const base = catalogoPartes.reduce<Record<string, string>>((acc, parte) => {
+                  acc[parte.nombre] = parte.opciones[0] || '';
+                  return acc;
+                }, {});
+                setEstadoEntrega(base);
+              }
               setShowModal(true);
             }}
             className="inline-flex items-center gap-2 px-5 py-3 bg-gradient-to-r from-emerald-500 to-teal-500 text-white text-sm font-medium rounded-full shadow-lg shadow-emerald-900/10 hover:shadow-xl transition-shadow"
@@ -342,7 +530,10 @@ export default function PrestamosTab() {
                   Alumno
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide">
-                  Libro
+                  Libro / Materia
+                </th>
+                <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide">
+                  Código
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide">
                   Fecha préstamo
@@ -380,6 +571,16 @@ export default function PrestamosTab() {
                       <div className="text-xs text-slate-500">
                         {prestamo.libro?.autor || 'Autor no indicado'}
                       </div>
+                      <div className="text-xs text-slate-500">
+                        {prestamo.libro?.materia?.nombre || 'Materia no asignada'} ·{' '}
+                        {prestamo.libro?.curso || 'Curso general'}
+                      </div>
+                      <div className="text-xs text-slate-500">
+                        Precio: {prestamo.libro?.precio ? `${prestamo.libro.precio.toFixed(2)} €` : 'n/d'}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-700">
+                      {prestamo.ejemplar_codigo || 'Sin código'}
                     </td>
                     {/* CAMBIO 3: Mostrar la fecha de préstamo en la tabla */}
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-700">
@@ -422,14 +623,22 @@ export default function PrestamosTab() {
                         </span>
                       )}
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-y-2">
+                      <button
+                        onClick={() => handleGenerarPDF(prestamo.id)}
+                        className="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-slate-200 text-slate-600 text-xs font-semibold hover:border-slate-300"
+                        disabled={isGeneratingPdf === prestamo.id}
+                      >
+                        <FileDown className="w-3.5 h-3.5" />
+                        {isGeneratingPdf === prestamo.id ? 'Generando...' : 'PDF'}
+                      </button>
                       {estadoActual !== 'devuelto' && (
                         <button
-                          onClick={() => handleDevolucion(prestamo)}
+                          onClick={() => openDevolucionModal(prestamo)}
                           className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-100 text-emerald-700 text-xs font-semibold hover:bg-emerald-200"
                         >
                           <CheckCircle className="w-3.5 h-3.5" />
-                          Marcar devuelto
+                          Registrar devolución
                         </button>
                       )}
                     </td>
@@ -478,6 +687,32 @@ export default function PrestamosTab() {
                 </div>
 
                 <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    Materia / Optativa
+                  </label>
+                  <select
+                    value={formData.materia_id}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        materia_id: e.target.value,
+                        libro_id: '',
+                        ejemplar_id: '',
+                      })
+                    }
+                    className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent text-sm"
+                  >
+                    <option value="">Ver todos los libros...</option>
+                    {materias.map((materia) => (
+                      <option key={materia.id} value={materia.id}>
+                        {materia.nombre} {materia.es_optativa ? '(Optativa)' : ''}{' '}
+                        {materia.curso ? `- ${materia.curso}` : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">Libro</label>
                   <select
                     required
@@ -486,15 +721,39 @@ export default function PrestamosTab() {
                     className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent text-sm"
                   >
                     <option value="">Seleccionar libro...</option>
-                    {libros
-                      .filter((libro) => libro.cantidad_disponible > 0)
-                      .map((libro) => (
-                        <option key={libro.id} value={libro.id}>
-                          {libro.titulo} - {libro.autor} ({libro.cantidad_disponible}{' '}
-                          disponibles)
-                        </option>
-                      ))}
+                    {librosDisponibles.map((libro) => (
+                      <option key={libro.id} value={libro.id}>
+                        {libro.titulo} - {libro.autor} ({libro.cantidad_disponible} disponibles)
+                      </option>
+                    ))}
                   </select>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    Ejemplar (código AMPA)
+                  </label>
+                  <select
+                    required
+                    value={formData.ejemplar_id}
+                    onChange={(e) => setFormData({ ...formData, ejemplar_id: e.target.value })}
+                    className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent text-sm"
+                    disabled={!formData.libro_id}
+                  >
+                    <option value="">
+                      {formData.libro_id ? 'Selecciona el ejemplar...' : 'Selecciona un libro primero'}
+                    </option>
+                    {ejemplaresDisponibles.map((ejemplar) => (
+                      <option key={ejemplar.id} value={ejemplar.id}>
+                        {ejemplar.codigo}
+                      </option>
+                    ))}
+                  </select>
+                  {formData.libro_id && ejemplaresDisponibles.length === 0 && (
+                    <p className="text-xs text-rose-500 mt-1">
+                      No quedan ejemplares disponibles para este título. Genera nuevos desde el catálogo.
+                    </p>
+                  )}
                 </div>
 
                 {/* CAMBIO 1.4: Nuevo campo de Fecha de Préstamo con fechas anteriores permitidas */}
@@ -539,6 +798,75 @@ export default function PrestamosTab() {
                     {describeDiasRestantes(formData.fecha_devolucion_esperada)})
                   </p>
                 </div>
+
+                <div className="space-y-3">
+                  <p className="text-sm font-medium text-slate-700">Estado del ejemplar entregado</p>
+                  {catalogoPartes.map((parte) => (
+                    <div key={parte.id} className="flex items-center gap-3">
+                      <span className="text-sm text-slate-600 w-32">{parte.nombre}</span>
+                      <select
+                        value={estadoEntrega[parte.nombre] || ''}
+                        onChange={(e) =>
+                          setEstadoEntrega((prev) => ({ ...prev, [parte.nombre]: e.target.value }))
+                        }
+                        className="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400"
+                      >
+                        {parte.opciones.map((opcion) => (
+                          <option key={opcion} value={opcion}>
+                            {opcion}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    Valoración / notas de entrega
+                  </label>
+                  <textarea
+                    value={formData.valoracion_entrega}
+                    onChange={(e) => setFormData({ ...formData, valoracion_entrega: e.target.value })}
+                    rows={2}
+                    className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent text-sm"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    Observaciones internas
+                  </label>
+                  <textarea
+                    value={formData.observaciones_entrega}
+                    onChange={(e) =>
+                      setFormData({ ...formData, observaciones_entrega: e.target.value })
+                    }
+                    rows={2}
+                    className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent text-sm"
+                  />
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 p-3 bg-slate-50">
+                  <label className="inline-flex items-start gap-3 text-sm text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={formData.normas_aceptadas}
+                      onChange={(e) =>
+                        setFormData({ ...formData, normas_aceptadas: e.target.checked })
+                      }
+                      className="mt-1 rounded border-slate-300 text-emerald-600 focus:ring-emerald-400"
+                    />
+                    <span>
+                      La familia conoce y acepta las normas de uso del programa solidario.
+                      <ul className="mt-2 space-y-1 text-xs text-slate-500 list-disc pl-4">
+                        {normasUso.map((norma) => (
+                          <li key={norma}>{norma}</li>
+                        ))}
+                      </ul>
+                    </span>
+                  </label>
+                </div>
               </div>
 
               <div className="flex gap-3 mt-6">
@@ -554,11 +882,184 @@ export default function PrestamosTab() {
                     setShowModal(false);
                     setFormData({
                       alumno_id: '',
+                      materia_id: '',
                       libro_id: '',
+                      ejemplar_id: '',
                       fecha_prestamo: new Date().toISOString().split('T')[0], 
                       fecha_devolucion_esperada: getDefaultDueDate(),
+                      valoracion_entrega: '',
+                      observaciones_entrega: '',
+                      normas_aceptadas: false,
                     });
+                    if (catalogoPartes.length) {
+                      const base = catalogoPartes.reduce<Record<string, string>>((acc, parte) => {
+                        acc[parte.nombre] = parte.opciones[0] || '';
+                        return acc;
+                      }, {});
+                      setEstadoEntrega(base);
+                    }
                   }}
+                  className="flex-1 px-4 py-2.5 bg-slate-100 text-slate-600 rounded-full font-medium hover:bg-slate-200 transition-colors"
+                >
+                  Cancelar
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {devolucionModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-2xl w-full p-6 border border-slate-100">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-xl font-semibold text-slate-800">Revisión y cierre</h3>
+                <p className="text-sm text-slate-500">
+                  {devolucionModal.alumno?.nombre} · {devolucionModal.libro?.titulo}
+                </p>
+              </div>
+              <button
+                onClick={closeDevolucionModal}
+                className="text-sm text-slate-500 hover:text-slate-700"
+              >
+                Cerrar
+              </button>
+            </div>
+
+            <form onSubmit={handleDevolucionSubmit} className="mt-4 space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    Fecha devolución real
+                  </label>
+                  <input
+                    type="date"
+                    required
+                    value={devolucionForm.fecha_devolucion_real}
+                    onChange={(e) =>
+                      setDevolucionForm({ ...devolucionForm, fecha_devolucion_real: e.target.value })
+                    }
+                    className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-400"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    Importe a cobrar (€)
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.5"
+                    value={devolucionForm.importe_cobrar}
+                    onChange={(e) =>
+                      setDevolucionForm({
+                        ...devolucionForm,
+                        importe_cobrar: parseFloat(e.target.value) || 0,
+                      })
+                    }
+                    className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-400"
+                  />
+                  <label className="inline-flex items-center gap-2 text-xs text-slate-600 mt-2">
+                    <input
+                      type="checkbox"
+                      checked={devolucionForm.abonado}
+                      onChange={(e) =>
+                        setDevolucionForm({ ...devolucionForm, abonado: e.target.checked })
+                      }
+                      className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-400"
+                    />
+                    Importe abonado / libro repuesto por la familia
+                  </label>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    Sustituir por ejemplar
+                  </label>
+                  <select
+                    value={devolucionForm.nuevo_ejemplar_id}
+                    onChange={(e) =>
+                      setDevolucionForm({ ...devolucionForm, nuevo_ejemplar_id: e.target.value })
+                    }
+                    className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-400 text-sm"
+                  >
+                    <option value="">No sustituir (revisión del mismo ejemplar)</option>
+                    {reemplazoEjemplares.map((ejemplar) => (
+                      <option key={ejemplar.id} value={ejemplar.id}>
+                        {ejemplar.codigo}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-slate-500 mt-1">
+                    Usa esta opción si entregan un ejemplar nuevo para dejarlo asignado al préstamo.
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <p className="text-sm font-medium text-slate-700">Estado al devolver</p>
+                {catalogoPartes.map((parte) => (
+                  <div key={parte.id} className="flex items-center gap-3">
+                    <span className="text-sm text-slate-600 w-32">{parte.nombre}</span>
+                    <select
+                      value={estadoDevolucion[parte.nombre] || ''}
+                      onChange={(e) =>
+                        setEstadoDevolucion((prev) => ({ ...prev, [parte.nombre]: e.target.value }))
+                      }
+                      className="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400"
+                    >
+                      {parte.opciones.map((opcion) => (
+                        <option key={opcion} value={opcion}>
+                          {opcion}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    Valoración AMPA
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={devolucionForm.valoracion_devolucion}
+                    onChange={(e) =>
+                      setDevolucionForm({ ...devolucionForm, valoracion_devolucion: e.target.value })
+                    }
+                    className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-400 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">
+                    Observaciones
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={devolucionForm.observaciones_devolucion}
+                    onChange={(e) =>
+                      setDevolucionForm({
+                        ...devolucionForm,
+                        observaciones_devolucion: e.target.value,
+                      })
+                    }
+                    className="w-full px-3 py-2.5 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-400 text-sm"
+                  />
+                </div>
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button
+                  type="submit"
+                  className="flex-1 px-4 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-500 text-white rounded-full font-medium hover:shadow-lg hover:shadow-emerald-900/10 transition-all"
+                >
+                  Guardar devolución
+                </button>
+                <button
+                  type="button"
+                  onClick={closeDevolucionModal}
                   className="flex-1 px-4 py-2.5 bg-slate-100 text-slate-600 rounded-full font-medium hover:bg-slate-200 transition-colors"
                 >
                   Cancelar
